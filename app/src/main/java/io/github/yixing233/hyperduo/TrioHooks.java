@@ -447,6 +447,11 @@ final class TrioHooks {
         // show_bolt / show_value, and the percentage container follows the master
         // switch.
         applyMeterText(meters);
+        // A meter that was mid-island when the module switched off must still
+        // receive MIUI's original replacement request - the replay re-drives
+        // every declined island with its real values. Under the new enable the
+        // same replay re-declines them, which is the state the hooks want.
+        replayBatteryIslandRequests();
     }
 
     /**
@@ -1136,7 +1141,7 @@ final class TrioHooks {
             log(module, "MobileTypeDrawable.mMobileType missing");
             return 0;
         }
-        return hook(module, Refl.method(drawable, "measure"),
+        final int sampled = hook(module, Refl.method(drawable, "measure"),
                 "hyperduo-mobile-type", new XposedInterface.Hooker() {
                     @Override
                     public Object intercept(XposedInterface.Chain chain) throws Throwable {
@@ -1151,6 +1156,25 @@ final class TrioHooks {
                         return result;
                     }
                 });
+        // Draw-level suppression. The classic mobile_type ImageView is re-shown
+        // by its binder's own flow, which does not go through setChildVisible -
+        // and its drawable paints text without consulting the view's bounds, so
+        // even the folded slot's 0x0 frame does not stop the ink (MIUI sets
+        // clipChildren=false up the chain). Gate only this dedicated drawable's
+        // draw, never View.draw: the sampling above stays intact either way, and
+        // the module's replacement label reads the same string from it.
+        final int drawn = hook(module, Refl.method(drawable, "draw", Canvas.class),
+                "hyperduo-mobile-type-draw", new XposedInterface.Hooker() {
+                    @Override
+                    public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                        final TrioAppearance a = TrioConfig.appearance();
+                        if (a.glyph && a.typeOutOfRing) {
+                            return null;
+                        }
+                        return chain.proceed();
+                    }
+                });
+        return sampled + drawn;
     }
 
     /**
@@ -1190,15 +1214,22 @@ final class TrioHooks {
                 "hyperduo-mobile-type-visible", new XposedInterface.Hooker() {
                     @Override
                     public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                        if (TrioConfig.appearance().typeOutOfRing) {
+                        final TrioAppearance a = TrioConfig.appearance();
+                        if (a.glyph && a.typeOutOfRing) {
                             final Object arg0 = chain.getArg(0);
                             final Object arg1 = chain.getArg(1);
-                            if (Boolean.TRUE.equals(arg1)
-                                    && arg0 instanceof View
-                                    && isNativeTypeView((View) arg0)) {
-                                // proceed(Object[]) replaces the arguments for
-                                // the intercepted call; the appear path never
-                                // runs, so no transient copy is made either.
+                            if (arg0 instanceof View && isNativeTypeView((View) arg0)) {
+                                // Both directions are suppressed, not just the
+                                // show: a false request on a visible target
+                                // makes the animator clone it into a transient
+                                // disappearance view, which paints the type
+                                // even after the slot has been folded away.
+                                // Marking it INVISIBLE first still lets the
+                                // call proceed, so MIUI cleans up any clone
+                                // bookkeeping it already holds.
+                                if (!Boolean.TRUE.equals(arg1)) {
+                                    prepareNativeTypeHide((View) arg0);
+                                }
                                 return chain.proceed(new Object[]{arg0, Boolean.FALSE});
                             }
                         }
@@ -1208,23 +1239,46 @@ final class TrioHooks {
     }
 
     /**
-     * Tracks the charging super island hiding the battery.
+     * Drops a native type view to INVISIBLE before MIUI animates it away, so
+     * the disappearance clone starts from an invisible original. Recorded in
+     * the collapse book, which is what the module's own restore path reads -
+     * these are views this module hid.
+     */
+    private static void prepareNativeTypeHide(View view) {
+        if (view.getVisibility() == View.VISIBLE && markCollapsed(view)) {
+            try {
+                view.setVisibility(View.INVISIBLE);
+            } catch (Throwable ignored) {
+                unmarkCollapsed(view);
+            }
+        }
+    }
+
+    /**
+     * Keeps the trio glyph on the bar while the charging super island is up.
      *
-     * <p>{@code MiuiBatteryMeterView.updateIslandChanged} - the one callee MIUI
-     * drives when the island appears or disappears - lands in
-     * {@code MiuiStatusBatteryContainer.setIsHideBattery(boolean)} plus a
-     * requestLayout. Hooking that setter is the narrowest point that sees both
-     * directions with the value MIUI actually settled on, for every container
-     * (each has its own battery meter and its own setter, and they all carry
-     * the same value).
+     * <p>{@code MiuiBatteryMeterView.updateIslandChanged(boolean, boolean)} is
+     * the one callee MIUI drives when the island appears or disappears; it
+     * normally lands in {@code setIsHideBattery(true)}, which stops the battery
+     * container reserving the meter's width - the native icon row slides right,
+     * and the glyph the module paints into that meter would be left floating in
+     * the vacated space. The module instead declines the replacement: the meter
+     * keeps its place, the row never moves, and the glyph - plus the arcs and
+     * dots - simply stay where they were while the island draws beside them.
+     * On-device verification for this shape is PR #10's.
      *
-     * <p>The flag flips three rules at once - the glyph stops painting, the
-     * Wi-Fi slot is handed back, and the out-of-ring reading takes over - so
-     * the reaction after recording is one re-fold of every claimed container
-     * plus a resync of both out-of-ring views, the same round
-     * {@code applyConfigChange} runs for a settings change. Posted: the setter
-     * itself runs before a layout, and the reaction adds no view from inside
-     * one.
+     * <p>The real request is remembered per meter in
+     * {@link #BATTERY_ISLAND_REQUESTS}, and {@link #replayBatteryIslandRequests}
+     * re-drives every remembered meter when a settings change flips
+     * {@code enabled}: a meter mid-island when the module switches off must get
+     * the replacement MIUI asked for, or the bar would sit batteryless until the
+     * next island event. {@code mStoreIsAddBatteryIsland} is restored after the
+     * call for the same reason - it is the value other code reads back.
+     *
+     * <p>The {@code setIsHideBattery} hook stays as the fallback path: if this
+     * meter hook is unavailable on some firmware, the old handover (hide the
+     * glyph, hand Wi-Fi back, read the signal out of ring) still applies, driven
+     * by the flag the setter records.
      */
     private static int hookIslandHide(XposedModule module, ClassLoader cl) {
         final Class<?> container = Refl.cls(
@@ -1233,7 +1287,20 @@ final class TrioHooks {
             log(module, "MiuiStatusBatteryContainer missing");
             return 0;
         }
-        return hook(module, Refl.method(container, "setIsHideBattery", Boolean.class),
+        final Class<?> meter = Refl.cls(
+                "com.android.systemui.statusbar.views.MiuiBatteryMeterView", cl);
+        int n = 0;
+        if (meter != null) {
+            n += hook(module, Refl.method(meter, "updateIslandChanged",
+                            boolean.class, boolean.class),
+                    "hyperduo-keep-island-battery", new XposedInterface.Hooker() {
+                        @Override
+                        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            return keepBatteryDuringIsland(chain);
+                        }
+                    });
+        }
+        n += hook(module, Refl.method(container, "setIsHideBattery", Boolean.class),
                 "hyperduo-island-hide", new XposedInterface.Hooker() {
                     @Override
                     public Object intercept(XposedInterface.Chain chain) throws Throwable {
@@ -1248,6 +1315,51 @@ final class TrioHooks {
                         return result;
                     }
                 });
+        return n;
+    }
+
+    /** Real island requests per meter, so a mid-island disable can replay them. */
+    private static final Map<Object, boolean[]> BATTERY_ISLAND_REQUESTS =
+            new WeakHashMap<Object, boolean[]>();
+
+    private static Object keepBatteryDuringIsland(XposedInterface.Chain chain) throws Throwable {
+        final boolean requested = Boolean.TRUE.equals(chain.getArg(0));
+        final boolean trigger = Boolean.TRUE.equals(chain.getArg(1));
+        synchronized (BATTERY_ISLAND_REQUESTS) {
+            BATTERY_ISLAND_REQUESTS.put(chain.getThisObject(),
+                    new boolean[] {requested, trigger});
+        }
+        // Declining the replacement while the module owns the glyph: the flag
+        // that stops the container from reserving the meter's width stays down,
+        // so the bar keeps the glyph exactly where it was. The island window
+        // and its clearance stay MIUI's - only the meter's participation moves.
+        final Object result = chain.proceed(new Object[] {
+                Boolean.valueOf(requested && !TrioConfig.get().enabled),
+                Boolean.valueOf(trigger)});
+        final Object meter = chain.getThisObject();
+        Refl.set(Refl.field(meter.getClass(), "mStoreIsAddBatteryIsland"), meter,
+                Boolean.valueOf(requested));
+        return result;
+    }
+
+    /**
+     * Re-drives every meter whose island request the module declined, with the
+     * real values. Run from a settings change: a meter that was mid-island when
+     * the module switched off must still receive MIUI's original request, or it
+     * would keep painting a battery the island had replaced until the next
+     * island event.
+     */
+    private static void replayBatteryIslandRequests() {
+        final Map<Object, boolean[]> requests;
+        synchronized (BATTERY_ISLAND_REQUESTS) {
+            requests = new HashMap<Object, boolean[]>(BATTERY_ISLAND_REQUESTS);
+        }
+        for (Map.Entry<Object, boolean[]> entry : requests.entrySet()) {
+            final boolean[] args = entry.getValue();
+            Refl.callArgs(entry.getKey(), "updateIslandChanged",
+                    new Class<?>[] {boolean.class, boolean.class},
+                    new Object[] {Boolean.valueOf(args[0]), Boolean.valueOf(args[1])});
+        }
     }
 
     /**
