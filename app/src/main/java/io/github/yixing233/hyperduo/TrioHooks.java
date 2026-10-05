@@ -2897,7 +2897,7 @@ final class TrioHooks {
         if (label.getVisibility() != View.VISIBLE
                 || !text.contentEquals(label.getText())
                 || label.suffixScale != TrioConfig.appearance().typeSuffixScale
-                || label.getTextSize() != TrioConfig.get().outTypeSize) {
+                || label.getTextSize() != outTypeSizePx(container)) {
             requestOutTypeSync(container);
             return;
         }
@@ -3107,7 +3107,7 @@ final class TrioHooks {
         // Its own setting, not the in-ring type_size: that one is authored for
         // the ring canvas' 120x120 design space and comes out far too small
         // once the label stands in the status bar's real pixel space.
-        final float size = a.outTypeSize;
+        final float size = outTypeSizePx(container);
         if (label.getTextSize() != size) {
             // PX, not the SP that the one-argument overload would use: the
             // status bar lays out in raw pixels, so the value is applied as-is
@@ -3222,24 +3222,47 @@ final class TrioHooks {
         // protected in View, and the result is identical.
         final boolean rtl =
                 container.getLayoutDirection() == View.LAYOUT_DIRECTION_RTL;
-        // The horizontal reference is the native icon row's own edge, not the
-        // battery meter's. The two coincide whenever the battery is laid out
-        // normally - which is why the meter worked, and why this changes
-        // nothing about the ordinary frame - but the charging super island
-        // breaks the equivalence: MiuiStatusBatteryContainer stops subtracting
-        // the battery's width from the row's bound (so the row slides clear of
-        // the island) while still measuring and laying the meter out at its old
-        // place and merely marking it INVISIBLE. Anchored on the meter, the
-        // reading then landed a whole battery width left of the row's real end,
-        // on top of the native icons that had moved there. The row's edge is the
-        // one bound that is right in both states - and it is also exactly where
-        // reserveOutRingStrip's padding ends, so the views land inside the strip
-        // they reserved rather than across the icons.
+        // Two references, because a view can be standing against either of two
+        // neighbours, and the two references are not interchangeable.
+        //
+        // Against the battery - the reading always, the label when no reading is
+        // mounted - the reference is the native icon row's own edge, not the
+        // meter's. The two coincide whenever the battery is laid out normally -
+        // which is why the meter worked, and why this changes nothing about the
+        // ordinary frame - but the charging super island breaks the equivalence:
+        // MiuiStatusBatteryContainer stops subtracting the battery's width from
+        // the row's bound (so the row slides clear of the island) while still
+        // measuring and laying the meter out at its old place and merely marking
+        // it INVISIBLE. Anchored on the meter, the reading then landed a whole
+        // battery width left of the row's real end, on top of the native icons
+        // that had moved there. The row's edge is the one bound that is right in
+        // both states - and it is also exactly where reserveOutRingStrip's
+        // padding ends, so the views land inside the strip they reserved rather
+        // than across the icons.
+        //
+        // Against the reading - the label when one is mounted - the reference is
+        // the reading's own edge. The two stand in that same reserved strip, one
+        // against the other, so handing both the row's edge stacks them: the
+        // label lands where the reading is and the type is drawn through the
+        // bars. reserveOutRingStrip reserves the two side by side, so this is
+        // also the only split that lands the pair exactly on the strip.
         final View icons = iconContainerIn(container);
         final boolean useIcons = icons != null && icons.getWidth() > 0;
-        final int edge = rtl
-                ? (useIcons ? icons.getLeft() : anchor.getRight())
-                : (useIcons ? icons.getRight() : anchor.getLeft());
+        // getWidth() and not only the class: a reading that has been measured
+        // but not yet laid out still carries an empty frame, and chaining off
+        // that would put the label at the container's far left for one pass. It
+        // falls back to the row's edge - where it stood before the reading
+        // existed - and the next placement chains it.
+        final boolean chainReading =
+                anchor instanceof OutSignalView && anchor.getWidth() > 0;
+        final int edge;
+        if (chainReading) {
+            edge = rtl ? anchor.getRight() : anchor.getLeft();
+        } else if (useIcons) {
+            edge = rtl ? icons.getLeft() : icons.getRight();
+        } else {
+            edge = rtl ? anchor.getRight() : anchor.getLeft();
+        }
         int left = rtl ? edge + gap : edge - gap - width;
         // Vertical reference stays with the anchor: its frame is laid out
         // unconditionally, so it is the same row centre island or not.
@@ -3318,6 +3341,12 @@ final class TrioHooks {
     private static int outSignalMargin(View container) {
         final float density = container.getResources().getDisplayMetrics().density;
         return Math.round(TrioConfig.appearance().outSignalMargin * density);
+    }
+
+    /** The out-of-ring label's font size in pixels, after the dp setting. */
+    private static float outTypeSizePx(View container) {
+        final float density = container.getResources().getDisplayMetrics().density;
+        return TrioConfig.appearance().outTypeSize * density;
     }
 
     /**
@@ -3792,13 +3821,16 @@ final class TrioHooks {
             total += signal.getMeasuredWidth() + signalGap;
         }
         if (labelOn) {
-            // The label keeps its inward gap - toward the reading, or the battery
-            // when it stands alone - and adds its outward gap only in that
-            // alone case, where the strip's far edge is what its outer side
-            // meets. With the reading in front, the gap between the two is the
-            // inward one already counted, so counting another would reserve a
-            // gap that is not drawn.
-            total += label.getMeasuredWidth() + (signalOn ? labelInward : labelInward + labelOutward);
+            // Both of the label's gaps are always drawn, so both are always
+            // reserved: the inward one separates it from the reading when one is
+            // mounted and from the battery when it stands alone, and the outward
+            // one separates it from the native icons on the other side in either
+            // case. Leaving the outward gap out whenever the reading was present
+            // - which is what this did - made the reserved total a little
+            // narrower than the span actually drawn, so the icons stopped flush
+            // against the label and the outward margin did nothing at all while
+            // the reading was on screen.
+            total += label.getMeasuredWidth() + labelInward + labelOutward;
         }
         if (total <= 0) {
             releaseOutTypeSpace(container);
