@@ -1727,12 +1727,37 @@ final class TrioHooks {
                 });
     }
 
-    /** The colour SystemUI last painted its own status bar icons in. */
-    private static volatile int sBarInk;
+    /**
+     * The colour SystemUI last painted the icons of one row in, keyed by that
+     * row's battery container.
+     *
+     * <p>Keyed per row because several rows are on screen at once and they are
+     * <em>not</em> tinted alike: the status bar sits on the launcher's light
+     * surface while the control centre beside it is dark, and both are tinted in
+     * the same frame. One shared slot therefore lets whichever row was tinted
+     * last decide for all of them, and every glyph draws in the opposite colour
+     * to the icons beside it - the inversion this replaced. The values are bare
+     * {@code Integer}s, so - unlike a {@code WeakHashMap<View, TextView>} - they
+     * cannot reach back and keep their own keys alive.
+     */
+    private static final Map<View, Integer> ROW_INK =
+            Collections.synchronizedMap(new WeakHashMap<View, Integer>());
 
-    /** That colour, or 0 before SystemUI has painted anything. */
-    static int barInk() {
-        return sBarInk;
+    /**
+     * The colour SystemUI last painted the icons of {@code row}'s own row in, or
+     * {@code 0} when that row has not been tinted yet.
+     */
+    static int rowInk(View row) {
+        if (row == null) {
+            return 0;
+        }
+        final Integer ink = ROW_INK.get(row);
+        return ink == null ? 0 : ink;
+    }
+
+    /** The row (battery container) {@code host} belongs to, or null. */
+    static View rowOf(View host) {
+        return batteryContainerOf(host);
     }
 
     /**
@@ -1756,16 +1781,29 @@ final class TrioHooks {
             public Object intercept(XposedInterface.Chain chain) throws Throwable {
                 final Object result = chain.proceed();
                 final List<Object> args = chain.getArgs();
-                if (args != null) {
-                    for (int i = 0; i < args.size(); i++) {
-                        final Object arg = args.get(i);
-                        if (arg instanceof Integer) {
-                            final int colour = (Integer) arg;
-                            if (colour != 0) {
-                                sBarInk = colour;
-                            }
-                            break;
-                        }
+                if (args == null) {
+                    return result;
+                }
+                int colour = 0;
+                for (int i = 0; i < args.size(); i++) {
+                    final Object arg = args.get(i);
+                    if (arg instanceof Integer) {
+                        colour = (Integer) arg;
+                        break;
+                    }
+                }
+                if (colour == 0) {
+                    return result;
+                }
+                // Filed against the row this icon belongs to, not one global
+                // cell: the status bar and the control centre are tinted in the
+                // same frame and to opposite colours, so a shared cell hands
+                // whichever was tinted last to both and inverts one of them.
+                final Object self = chain.getThisObject();
+                if (self instanceof View) {
+                    final View row = rowOf((View) self);
+                    if (row != null) {
+                        ROW_INK.put(row, colour);
                     }
                 }
                 return result;
